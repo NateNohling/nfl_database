@@ -1,0 +1,250 @@
+#' Update Data Directory of Play-By-Play
+#'
+#' @param data_dir Data Directory
+#' @param force_rebuild Hybrid parameter (logical or numeric) to rebuild parts
+#' of data directory
+#'
+#' @export
+#'
+#' @importFrom cli cli_alert_info cli_alert_danger cli_alert_success
+#' @importFrom nflfastR build_nflfastR_pbp
+#' @importFrom nflreadr load_schedules
+#'
+update_data_dir <- function(data_dir, force_rebuild = FALSE) {
+  user_message <- function(..., type = "ui") {
+    message <- glue::glue(...)
+    
+    if (type == "ui") {
+      cli::cli_ul(
+        glue::glue(
+          "{strftime(Sys.time(), format = '%H:%M:%S')} | ",
+          "{message}"
+        )
+      )
+    }
+    if (type == "alert_info") {
+      cli::cli_alert_info(
+        glue::glue(
+          "{strftime(Sys.time(), format = '%H:%M:%S')} | ",
+          "{message}"
+        )
+      )
+    }
+    if (type == "alert_danger") {
+      cli::cli_alert_danger(
+        glue::glue(
+          "{strftime(Sys.time(), format = '%H:%M:%S')} | ",
+          "{message}"
+        )
+      )
+    }
+    if (type == "alert_success") {
+      cli::cli_alert_success(
+        glue::glue(
+          "{strftime(Sys.time(), format = '%H:%M:%S')} | ",
+          "{message}"
+        )
+      )
+    }
+
+  }
+  get_missing_games <- function(completed_games, data_dir) {
+    db_ids <- arrow::open_dataset(
+      here::here(data_dir)
+    ) |>
+      dplyr::select("game_id") |>
+      dplyr::collect() |>
+      dplyr::distinct() |>
+      dplyr::pull("game_id")
+
+    need_scrape <- completed_games[!completed_games %in% db_ids]
+
+    glue::glue(
+      "You have {length(db_ids)} games and are missing {length(need_scrape)}."
+    ) |>
+      user_message(
+        type = "alert_info"
+      )
+
+    return(need_scrape)
+  }
+  build_db <- function(data_dir, rebuild = FALSE) {
+    load_write_pbp <- function(seasons, data_dir) {
+      get_data_pbp <- function(season){
+        base::dir.create(
+          base::file.path("temp_dir", season)
+        )
+
+        utils::download.file(
+          glue::glue(
+            "https://github.com/nflverse/nflfastR-data/raw/master/data/",
+            "play_by_play_{season}.parquet?raw=true"
+          ),
+          file.path("temp_dir", season, "data.parquet"),
+          quiet = TRUE
+        )
+      }
+
+      base::dir.create("temp_dir")
+
+      purrr::walk(seasons, get_data_pbp)
+
+      arrow::open_dataset(
+        "temp_dir",
+        partitioning = "season",
+        format = "parquet"
+      ) |>
+        arrow::write_dataset(
+          here::here(data_dir),
+          format = "parquet",
+          partitioning = "season"
+        )
+
+      base::unlink("temp_dir", recursive = TRUE)
+    }
+
+    valid_seasons <- nflreadr::load_schedules() |>
+      dplyr::filter(.data$season >= 1999 & !is.na(.data$result)) |>
+      dplyr::distinct(.data$season) |>
+      dplyr::pull(.data$season)
+
+    if (base::all(rebuild == TRUE)) {
+      user_message(
+        "Purging the complete directory {here::here(data_dir)} ",
+        "in your data directory..."
+      )
+
+      base::unlink(here::here(data_dir), recursive = TRUE)
+
+      seasons <- valid_seasons
+
+      glue::glue(
+        "Starting download of {base::length(seasons)} seasons between",
+        " {base::min(seasons)} and {base::max(seasons)}..."
+      ) |>
+        user_message()
+
+    }
+    else
+      if (base::is.numeric(rebuild) & all(rebuild %in% valid_seasons)) {
+        season_string <- base::paste0(rebuild, collapse = ", ")
+
+        glue::glue(
+          "Purging {season_string} season(s) from the directory ",
+          "{here::here(data_dir)} in your data directory..."
+        ) |>
+          user_message()
+
+        data_path_unlink <- base::paste0("season=", rebuild)
+
+        base::unlink(here::here(data_dir, data_path_unlink), recursive = TRUE)
+
+        seasons <- valid_seasons[valid_seasons %in% rebuild]
+
+        glue::glue("Starting download of the {season_string} season(s)...") |>
+          user_message()
+
+      }
+    else
+      if (base::all(rebuild == "NEW")) {
+        user_message(
+          "Can't find the directory {here::here(data_dir)} in your data ",
+          "directory. Will load the play by play data from scratch.",
+          type = "alert_info"
+        )
+        seasons <- valid_seasons
+
+        glue::glue(
+          "Starting download of {base::length(seasons)} seasons between",
+          " {base::min(seasons)} and {base::max(seasons)}..."
+        ) |>
+          user_message()
+      }
+    else {
+      seasons <- NULL
+      user_message(
+        "At least one invalid value passed to argument {.val force_rebuild}. ",
+        "Please try again with valid input.",
+        type = "alert_danger"
+      )
+    }
+
+    if (!base::is.null(seasons)) {
+      load_write_pbp(seasons, data_dir)
+    }
+  }
+
+  # create data directory if it doesn't exist or user forces rebuild
+
+  if (!base::dir.exists(here::here(data_dir))) {
+    build_db(data_dir, rebuild = "NEW")
+  }
+  else
+    if (base::dir.exists(here::here(data_dir)) &
+        base::all(force_rebuild != FALSE)) {
+      build_db(data_dir, rebuild = force_rebuild)
+    }
+
+  # get completed games using Lee's file (thanks Lee!)
+
+  user_message("Checking for missing completed games...")
+
+  completed_games <- nflreadr::load_schedules() |>
+    dplyr::filter(
+      .data$season >= 1999,
+      !is.na(.data$result),
+      !.data$game_id %in% c("1999_01_BAL_STL",
+                            "2000_06_BUF_MIA",
+                            "2000_03_SD_KC")
+    ) |>
+    dplyr::arrange(.data$gameday) |>
+    dplyr::pull(.data$game_id)
+
+  missing_games <- get_missing_games(completed_games, data_dir)
+
+  # rebuild db if number of missing games is too large
+
+  if (base::length(missing_games) > 16) {
+    build_db(
+      data_dir,
+      rebuild = base::as.numeric(
+        base::unique(
+          stringr::str_sub(missing_games, 1, 4)
+        )
+      )
+    )
+
+    missing_games <- get_missing_games(completed_games, data_dir)
+  }
+
+  # if there's missing games, scrape and write to db
+
+  if (base::length(missing_games) > 0) {
+    data_pbp_new <- nflfastR::build_nflfastR_pbp(missing_games, rules = FALSE)
+
+    if (base::nrow(data_pbp_new) == 0) {
+      user_message(
+        "Raw data of new games are not yet ready.",
+        " Please try again in about 10 minutes.",
+        type = "alert_danger"
+      )
+    }
+    else {
+      user_message("Appending new data to data directory...")
+
+      data_pbp_new |>
+        arrow::write_dataset(
+          here::here(data_dir),
+          format = "parquet",
+          partitioning = "season"
+        )
+    }
+  }
+
+  user_message(
+    "Data directory update completed",
+    type = "alert_success"
+  )
+
+  user_message("Path to your data {here::here(data_dir)}")
+}
